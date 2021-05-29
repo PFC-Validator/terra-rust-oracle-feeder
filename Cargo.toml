@@ -12,10 +12,10 @@ categories = ["oracle"]
 
 
 [dependencies]
-terra-rust-api =  {version="0.1.12"}
-#terra-rust-api =  {version="0.1.8", path= "../terraRust/terra-rust-api"}
+#terra-rust-api =  {version="0.1.12"}
+terra-rust-api =  { path= "../terra-rust/terra-rust-api"}
 error-chain = "0.12.2"
-tokio = { version = "1.4", features = ["full"] }
+tokio = { version = "1.6", features = ["full"] }
 structopt = "0.3"
 env_logger = "0.8.3"
 log="0.4"

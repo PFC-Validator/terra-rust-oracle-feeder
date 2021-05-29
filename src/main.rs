@@ -6,14 +6,12 @@ use dotenv::dotenv;
 use log::{debug, error, info};
 // use serde::{Deserialize, Serialize};
 // use std::env;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{Duration, Utc};
 use std::thread::sleep;
 use std::time::SystemTime;
 use structopt::StructOpt;
-use terra_rust_api::core_types::{Coin, Msg};
-use terra_rust_api::messages::oracle::{
-    MsgAggregateExchangeRatePreVote, MsgAggregateExchangeRateVote,
-};
+use terra_rust_api::core_types::Coin;
+use terra_rust_api::messages::oracle::MsgAggregateExchangeRateVote;
 use terra_rust_api::{GasOptions, PrivateKey, Terra};
 const VERSION: Option<&'static str> = option_env!("CARGO_PKG_VERSION");
 const NAME: Option<&'static str> = option_env!("CARGO_PKG_NAME");
@@ -27,6 +25,7 @@ use price_server::PriceServer;
 use rand::RngCore;
 use rust_decimal_macros::dec;
 use std::collections::{HashMap, HashSet};
+use terra_rust_api::messages::Message;
 
 #[derive(StructOpt)]
 struct Cli {
@@ -200,8 +199,8 @@ async fn do_vote<'a>(
     }
 
     let feeder_public = feeder_key.public_key(&secp);
-    let mut messages: Vec<Box<dyn Msg>> = vec![];
-    let vote_message = MsgAggregateExchangeRateVote::create(
+    let mut messages: Vec<Message> = vec![];
+    let vote_message_internal = MsgAggregateExchangeRateVote::create_internal(
         salt_string.clone(),
         coins,
         feeder_public.account()?,
@@ -209,19 +208,19 @@ async fn do_vote<'a>(
     );
     let pre = match previous_salt_string {
         Some(prev_salt) => {
-            let pre_vote_message: MsgAggregateExchangeRatePreVote =
-                vote_message.gen_pre_vote(&prev_salt);
-            messages.push(Box::new(vote_message));
+            let pre_vote_message = vote_message_internal.gen_pre_vote(&prev_salt);
+            let vote_message =
+                MsgAggregateExchangeRateVote::create_from_internal(vote_message_internal);
+            messages.push(vote_message);
             pre_vote_message
         }
         None => {
-            let pre_vote_message: MsgAggregateExchangeRatePreVote =
-                vote_message.gen_pre_vote(&salt_string);
+            let pre_vote_message = vote_message_internal.gen_pre_vote(&salt_string);
             pre_vote_message
         }
     };
 
-    messages.push(Box::new(pre));
+    messages.push(pre);
 
     let memo = format!(
         "PFC-{}@{}",
@@ -232,26 +231,31 @@ async fn do_vote<'a>(
     let (signed_msg, sigs) = terra
         .generate_transaction_to_broadcast(secp, feeder_key, &messages, Some(memo))
         .await?;
-    let resp = terra.tx().broadcast_async(&signed_msg, &sigs).await?;
-    /*
-       match resp.code {
-           Some(code) => {
-               log::error!("{}", serde_json::to_string(&resp)?);
-               eprintln!("Transaction returned a {} {}", code, resp.txhash);
-               log::error!("TX FAIL {}", resp.txhash);
-               Ok(false)
-           }
-           None => {
-               log::info!("TX  OK  {}", resp.txhash);
-               println!("TX OK {}", resp.txhash);
-               Ok(true)
-           }
-       }
+    log::info!(
+        "Account # {} - Sequence # {} Messages # {}",
+        signed_msg.account_number,
+        signed_msg.sequence,
+        messages.len()
+    );
 
-    */
+    let resp = terra.tx().broadcast_sync(&signed_msg, &sigs).await?;
 
-    println!("TX OK {}", resp.txhash);
-    Ok(true)
+    match resp.code {
+        Some(code) => {
+            log::error!("{}", serde_json::to_string(&resp)?);
+            eprintln!("Transaction returned a {} {}", code, resp.txhash);
+            log::error!("TX FAIL {}", resp.txhash);
+            Ok(false)
+        }
+        None => {
+            log::info!("TX  OK  {}", resp.txhash);
+            println!("TX OK {}", resp.txhash);
+            Ok(true)
+        }
+    }
+
+    //println!("TX OK {}", resp.txhash);
+    // Ok(true)
 }
 /// Generate the random string
 fn gen_salt() -> [u8; 2] {
@@ -306,81 +310,85 @@ async fn run() -> Result<()> {
     let mut salt_string = gen_salt();
 
     loop {
-        let hour_loop: DateTime<Utc> = Utc::now().checked_add_signed(Duration::hours(1)).unwrap();
-        // TODO refresh things here like keys
+        let now = SystemTime::now();
 
-        while hour_loop > Utc::now() {
-            let now = SystemTime::now();
+        if terra.debug {
+            log::debug!("Refreshing Oracle Parameters");
+        }
+        let oracle_params = terra.oracle().parameters().await?;
+        let height = oracle_params.height;
+        let tick = height / oracle_params.result.vote_period;
+        if last_vote_period.is_none() || tick > last_vote_period.unwrap_or(0) {
+            let mut denoms_wanted_set: HashSet<String> = HashSet::new();
+
+            let denoms_wanted = oracle_params.result.whitelist;
+            for currency_pair in denoms_wanted.iter() {
+                let conv = u_currency_to_real(&currency_pair.name)?;
+                denoms_wanted_set.insert(String::from(conv));
+            }
 
             if terra.debug {
-                log::debug!("Refreshing Oracle Parameters");
+                log::debug!(
+                    "Validator wants following currencies - {}",
+                    serde_json::to_string(&denoms_wanted_set)?
+                );
             }
-            let oracle_params = terra.oracle().parameters().await?;
-            if last_vote_period.is_none()
-                || oracle_params.result.vote_period > last_vote_period.unwrap_or(0)
+            for wanted in &denoms_wanted_set {
+                if !denoms_set.contains(wanted.as_str()) {
+                    return Err(format!("Missing currency {}", wanted).into());
+                }
+            }
+            //  denoms_wanted_set.insert(String::from("xyz"));
+
+            sleep(std::time::Duration::from_millis(20));
+
+            match do_vote(
+                &secp,
+                &terra,
+                &price_server,
+                &private_key,
+                &cli.validator,
+                &denoms_wanted_set,
+                previous_salt_string.clone(),
+                hex::encode(salt_string),
+            )
+            .await
             {
-                let mut denoms_wanted_set: HashSet<String> = HashSet::new();
-
-                let denoms_wanted = oracle_params.result.whitelist;
-                for currency_pair in denoms_wanted.iter() {
-                    let conv = u_currency_to_real(&currency_pair.name)?;
-                    denoms_wanted_set.insert(String::from(conv));
-                }
-
-                if terra.debug {
-                    log::debug!(
-                        "Validator wants following currencies - {}",
-                        serde_json::to_string(&denoms_wanted_set)?
-                    );
-                }
-                for wanted in &denoms_wanted_set {
-                    if !denoms_set.contains(wanted.as_str()) {
-                        return Err(format!("Missing currency {}", wanted).into());
+                Ok(result) => {
+                    if result {
+                        last_vote_period = Some(tick);
+                        previous_salt_string = Some(hex::encode(salt_string));
+                        salt_string = gen_salt();
+                    } else {
+                        todo!();
                     }
                 }
-                //  denoms_wanted_set.insert(String::from("xyz"));
-
-                sleep(std::time::Duration::from_millis(20));
-
-                match do_vote(
-                    &secp,
-                    &terra,
-                    &price_server,
-                    &private_key,
-                    &cli.validator,
-                    &denoms_wanted_set,
-                    previous_salt_string.clone(),
-                    hex::encode(salt_string),
-                )
-                .await
-                {
-                    Ok(result) => {
-                        if result {
-                            last_vote_period = Some(oracle_params.result.vote_period);
-                            previous_salt_string = Some(hex::encode(salt_string));
-                            salt_string = gen_salt();
-                        }
-                    }
-                    Err(ref e) => {
-                        eprintln!("Vote Failed {}", e);
-                        log::error!("Vote Failed {}", e)
-                    }
+                Err(ref e) => {
+                    eprintln!("Vote Failed {}", e);
+                    log::error!("Vote Failed {}", e);
+                    todo!();
                 }
-            } else {
-                log::debug!("vote period of {} ", last_vote_period.unwrap_or(0))
             }
-            let end = SystemTime::now();
-            let diff = end.duration_since(now)?;
+        } else {
+            log::info!(
+                "vote period of {} tick = {} height = {} next tick at = {}",
+                last_vote_period.unwrap_or(0),
+                tick,
+                height,
+                (tick + 1) * oracle_params.result.vote_period
+            )
+        }
+        let end = SystemTime::now();
+        let diff = end.duration_since(now)?;
+        if terra.debug {
+            log::debug!("Feed Submission took {:#?}", diff);
+        }
+        if diff.as_millis() < 5000 {
+            let sleep_time = std::time::Duration::from_millis(5000) - diff;
             if terra.debug {
-                log::debug!("Feed Submission took {:#?}", diff);
+                log::debug!("Sleeping for {:#?}", sleep_time);
             }
-            if diff.as_millis() < 5000 {
-                let sleep_time = std::time::Duration::from_millis(5000) - diff;
-                if terra.debug {
-                    log::debug!("Sleeping for {:#?}", sleep_time);
-                }
-                sleep(sleep_time);
-            }
+            sleep(sleep_time);
         }
     }
 }
